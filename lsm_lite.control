@@ -1,0 +1,4 @@
+comment = 'LSM-Lite: Custom Key-Value Storage Engine'
+default_version = '1.0'
+module_pathname = '$libdir/lsm_lite'
+relocatable = true
