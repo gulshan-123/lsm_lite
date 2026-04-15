@@ -91,6 +91,42 @@ static void lsm_shmem_startup(void) {
         for (int i = 0; i < MAX_LEVEL; i++) 
             Manifest->immutable_mem.nodes[0].next[i] = LSM_NULL_INDEX;
 
+        
+        // --- 1. MANIFEST RECOVERY ---
+        FILE* manifest_fp = fopen("lsm_data/manifest.bin", "rb");
+        if (manifest_fp) {
+            fread(Manifest->file_counts, sizeof(int), MAX_LSM_LEVELS, manifest_fp);
+            fclose(manifest_fp);
+            elog(LOG, "LSM Recovery: Manifest loaded successfully.");
+        }
+
+        // --- 2. WAL RECOVERY (Immutable) ---
+        // If the database crashed while the BGWorker was flushing, this file still exists!
+        FILE* wal_immut = fopen("lsm_data/wal_immutable.bin", "rb");
+        if (wal_immut) {
+            uint32_t k, v;
+            while (fread(&k, sizeof(uint32_t), 1, wal_immut) == 1 && 
+                   fread(&v, sizeof(uint32_t), 1, wal_immut) == 1) {
+                sl_insert(&Manifest->immutable_mem, k, v);
+            }
+            fclose(wal_immut);
+            // Tell the BGWorker to immediately flush this recovered data when it starts
+            Manifest->is_flushing = true; 
+            elog(LOG, "LSM Recovery: Immutable WAL recovered.");
+        }
+
+        // --- 3. WAL RECOVERY (Active) ---
+        FILE* wal_active = fopen("lsm_data/wal_active.bin", "rb");
+        if (wal_active) {
+            uint32_t k, v;
+            while (fread(&k, sizeof(uint32_t), 1, wal_active) == 1 && 
+                   fread(&v, sizeof(uint32_t), 1, wal_active) == 1) {
+                sl_insert(&Manifest->active_mem, k, v);
+            }
+            fclose(wal_active);
+            elog(LOG, "LSM Recovery: Active WAL recovered.");
+        }
+
         elog(LOG, "LSM-Lite: Static Shared Memory Skip List perfectly initialized.");
     }
 
@@ -148,10 +184,17 @@ retry:
             Manifest->immutable_mem = temp;
             
             // The active_mem is already perfectly clean thanks to the BGWorker!
-            
+            rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");    
             Manifest->is_flushing = true;
             SetLatch(&Manifest->bgw_latch);
         }
+    }
+
+    FILE* wal_fp = fopen("lsm_data/wal_active.bin", "ab");
+    if (wal_fp) {
+        fwrite(&key, sizeof(uint32_t), 1, wal_fp);
+        fwrite(&val, sizeof(uint32_t), 1, wal_fp);
+        fclose(wal_fp);
     }
 
     bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, (uint32_t)val);
@@ -271,6 +314,17 @@ lsm_worker_main(Datum main_arg) {
                         elog(ERROR, "LSM Compaction Failed!");
                         break;
                     }
+                }
+                // --- DELETE THE OBSOLETE WAL ---
+                unlink("lsm_data/wal_immutable.bin");
+                // --- SAVE THE MANIFEST TO DISK ---
+                // We write to a temporary file and rename it to prevent corruption 
+                // if the server crashes exactly while writing the manifest.
+                FILE* manifest_fp = fopen("lsm_data/manifest.tmp", "wb");
+                if (manifest_fp) {
+                    fwrite(Manifest->file_counts, sizeof(int), MAX_LSM_LEVELS, manifest_fp);
+                    fclose(manifest_fp);
+                    rename("lsm_data/manifest.tmp", "lsm_data/manifest.bin");
                 }
             } 
             else 
