@@ -18,6 +18,9 @@
 #define MAX_LSM_LEVELS 10
 #define COMPACTION_THRESHOLD 4
 
+// Use the maximum positive 32-bit integer as the delete marker
+#define LSM_TOMBSTONE_VAL 2147483647
+
 PG_MODULE_MAGIC;
 
 // The Global Manifest 
@@ -158,6 +161,7 @@ void _PG_init(void) {
 // Postgres requires this macro to expose functions to SQL
 PG_FUNCTION_INFO_V1(lsm_put);
 PG_FUNCTION_INFO_V1(lsm_get);
+PG_FUNCTION_INFO_V1(lsm_delete);
 
 Datum lsm_put(PG_FUNCTION_ARGS) {
     int32 key = PG_GETARG_INT32(0);
@@ -235,10 +239,57 @@ end_search:
     LWLockRelease(memtable_lock);
 
     if (found) {
-        PG_RETURN_INT32((int32)val);
+        if (val == LSM_TOMBSTONE_VAL) {
+            // We found the key, but it's a Tombstone! It has been deleted.
+            PG_RETURN_NULL();
+        } else {
+            PG_RETURN_INT32((int32)val);
+        }
     } else {
         PG_RETURN_NULL();
     }
+}
+
+Datum lsm_delete(PG_FUNCTION_ARGS) {
+    int32 key = PG_GETARG_INT32(0);
+
+    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
+    LWLock *memtable_lock = &lock_array[0].lock; 
+
+retry:
+    LWLockAcquire(memtable_lock, LW_EXCLUSIVE);
+
+    if (Manifest->active_mem.free_head_idx == LSM_NULL_INDEX) {
+        if (Manifest->is_flushing) {
+            LWLockRelease(memtable_lock);
+            pg_usleep(10000);
+            goto retry;
+        } else {
+            // THE SWAP
+            SkipList temp = Manifest->active_mem;
+            Manifest->active_mem = Manifest->immutable_mem;
+            Manifest->immutable_mem = temp;
+            
+            rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");
+            Manifest->is_flushing = true;
+            SetLatch(&Manifest->bgw_latch);
+        }
+    }
+
+    // Write Tombstone to WAL
+    FILE* wal_fp = fopen("lsm_data/wal_active.bin", "ab");
+    if (wal_fp) {
+        uint32_t tombstone = LSM_TOMBSTONE_VAL;
+        fwrite(&key, sizeof(uint32_t), 1, wal_fp);
+        fwrite(&tombstone, sizeof(uint32_t), 1, wal_fp);
+        fclose(wal_fp);
+    }
+
+    // Insert Tombstone into memory
+    bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, LSM_TOMBSTONE_VAL);
+
+    LWLockRelease(memtable_lock);
+    PG_RETURN_BOOL(success);
 }
 
 // Define flag for loop exit
