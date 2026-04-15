@@ -4,6 +4,7 @@
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "storage/lwlock.h"
+#include "utils/builtins.h"
 #include "lsm_skiplist.h" // Your Week 1 header
 
 #define LSM_MAX_NODES 500000 // roughly 16MB depending on struct size
@@ -86,4 +87,48 @@ void _PG_init(void) {
 
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = lsm_shmem_startup;
+}
+
+// Postgres requires this macro to expose functions to SQL
+PG_FUNCTION_INFO_V1(lsm_put);
+PG_FUNCTION_INFO_V1(lsm_get);
+
+Datum lsm_put(PG_FUNCTION_ARGS) {
+    int32 key = PG_GETARG_INT32(0);
+    int32 val = PG_GETARG_INT32(1);
+
+    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
+    // Use Lock 0 as the global MemTable Write Lock
+    LWLock *memtable_lock = &lock_array[0].lock; 
+
+    // Acquire EXCLUSIVE lock. Only one process can insert at a exact millisecond.
+    LWLockAcquire(memtable_lock, LW_EXCLUSIVE);
+
+    bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, (uint32_t)val);
+
+    LWLockRelease(memtable_lock);
+
+    PG_RETURN_BOOL(success);
+}
+
+Datum lsm_get(PG_FUNCTION_ARGS) {
+    int32 key = PG_GETARG_INT32(0);
+    uint32_t val;
+
+    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
+    // Use Lock 0 as the global MemTable Read Lock
+    LWLock *memtable_lock = &lock_array[0].lock; 
+
+    // Acquire SHARED lock. Multiple SELECTs can read simultaneously!
+    LWLockAcquire(memtable_lock, LW_SHARED);
+
+    bool found = sl_search(&Manifest->active_mem, (uint32_t)key, &val);
+
+    LWLockRelease(memtable_lock);
+
+    if (found) {
+        PG_RETURN_INT32((int32)val);
+    } else {
+        PG_RETURN_NULL();
+    }
 }

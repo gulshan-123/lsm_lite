@@ -2,15 +2,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-SkipList* sl_create(int capacity, void* list_mem, void* nodes_mem) {
-    SkipList* list = list_mem;
-    if (list_mem == NULL)
-        list = (SkipList*)malloc(sizeof(SkipList));
+SkipList* sl_create(int capacity) {
+    SkipList*  list = (SkipList*)malloc(sizeof(SkipList));
     list->capacity = capacity;
-
-    list->nodes = nodes_mem;
-    if (nodes_mem == NULL)
-        list->nodes = (SkipNode*)malloc(sizeof(SkipNode) * capacity);
+    list->nodes = (SkipNode*)malloc(sizeof(SkipNode) * capacity);
     
     // Initialize the free list pool. 
     // next[0] acts as the pointer to the next free node.
@@ -91,5 +86,21 @@ bool sl_insert(SkipList* list, uint32_t key, uint32_t value) {
     }
 
     return true;
+}
+
+bool sl_search(SkipList* list, uint32_t key, uint32_t* out_value) {
+    int current = list->head_idx;
+    for (int i = list->current_level - 1; i >= 0; i--) {
+        while (list->nodes[current].next[i] != LSM_NULL_INDEX &&
+               list->nodes[list->nodes[current].next[i]].key < key) {
+            current = list->nodes[current].next[i];
+        }
+    }
+    current = list->nodes[current].next[0];
+    if (current != LSM_NULL_INDEX && list->nodes[current].key == key) {
+        *out_value = list->nodes[current].value;
+        return true;
+    }
+    return false;
 }
 
