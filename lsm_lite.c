@@ -227,6 +227,8 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
         found = sl_search(&Manifest->immutable_mem, (uint32_t)key, &val);
     }
 
+    LWLockRelease(memtable_lock);
+
     if (!found) {
         // Search Disk: Level by Level, Newest to Oldest
         for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
@@ -243,7 +245,6 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
     }
 
 end_search:
-    LWLockRelease(memtable_lock);
 
     if (found) {
         if (val == LSM_TOMBSTONE_VAL) {
