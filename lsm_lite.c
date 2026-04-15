@@ -11,6 +11,14 @@
 #include "lsm_skiplist.h" // Your Week 1 header
 #include "lsm_sstable.h"
 
+// for fdw
+#include "foreign/fdwapi.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
+#include "catalog/pg_type.h"
+#include "access/htup_details.h"
+
 #include <sys/stat.h> // For mkdir
 
 #define LSM_MAX_NODES 20 // roughly 16MB depending on struct size
@@ -234,6 +242,38 @@ retry:
     PG_RETURN_BOOL(success);
 }
 
+// Put this above your SQL functions
+bool lsm_internal_get(uint32_t key, uint32_t *out_val) {
+    bool found = false;
+    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
+    LWLock *memtable_lock = &lock_array[0].lock; 
+
+    // Memory Search
+    LWLockAcquire(memtable_lock, LW_SHARED);
+    found = sl_search(&Manifest->active_mem, key, out_val);
+    if (!found && Manifest->is_flushing)
+        found = sl_search(&Manifest->immutable_mem, key, out_val);
+        
+    // Disk Search (Thread-Safe)
+    if (!found) {
+        for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
+            for (int idx = Manifest->file_counts[lvl] - 1; idx >= 0; idx--) {
+                char filename[256];
+                snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
+                if (sst_read(filename, key, out_val)) {
+                    found = true;
+                    goto end_search; 
+                }
+            }
+        }
+    }
+    
+end_search:
+    LWLockRelease(memtable_lock);
+    if (found && *out_val == LSM_TOMBSTONE_VAL) return false;
+    return found;
+}
+
 Datum lsm_get(PG_FUNCTION_ARGS) {
     int32 key = PG_GETARG_INT32(0);
     uint32_t val;
@@ -441,5 +481,137 @@ lsm_worker_main(Datum main_arg) {
     
     DisownLatch(&Manifest->bgw_latch);
     proc_exit(0);
+}
+
+typedef struct {
+    int32 search_key;
+    bool already_returned;
+} LsmFdwState;
+
+// --- 1. PLANNER: Extract 'key = X' from the AST ---
+static void lsmGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
+    ListCell *lc;
+    bool found_key = false;
+
+    foreach(lc, baserel->baserestrictinfo) {
+        RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+        if (IsA(ri->clause, OpExpr)) {
+            OpExpr *op = (OpExpr *) ri->clause;
+            if (list_length(op->args) == 2) {
+                Node *left = linitial(op->args);
+                Node *right = lsecond(op->args);
+                // Check if it is "column = constant"
+                if (IsA(left, Var) && IsA(right, Const)) {
+                    Var *var = (Var *) left;
+                    Const *cst = (Const *) right;
+                    // Enforce that they are searching on the first column (key)
+                    if (var->varattno == 1 && !cst->constisnull) {
+                        found_key = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!found_key) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("LSM-Lite requires a 'WHERE key = <constant>' clause.")));
+    }
+    
+    baserel->rows = 1; // We only return 1 row for a KV lookup
+}
+
+static void lsmGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
+    add_path(baserel, (Path *) create_foreignscan_path(root, baserel, NULL, baserel->rows, 10.0, 10.0, NIL, NULL, NULL, NIL, NIL));
+}
+
+static ForeignScan *lsmGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses, Plan *outer_plan) {
+    int32 extracted_key = -1;
+    ListCell *lc;
+    
+    // Extract the exact integer value to pass to the executor
+    foreach(lc, baserel->baserestrictinfo) {
+        RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+        if (IsA(ri->clause, OpExpr)) {
+            OpExpr *op = (OpExpr *) ri->clause;
+            if (IsA(linitial(op->args), Var) && IsA(lsecond(op->args), Const)) {
+                Const *cst = (Const *) lsecond(op->args);
+                extracted_key = DatumGetInt32(cst->constvalue);
+                break;
+            }
+        }
+    }
+
+    // Pass the extracted key safely using an integer list in fdw_private
+    List *fdw_private = list_make1_int(extracted_key);
+    scan_clauses = extract_actual_clauses(scan_clauses, false);
+    
+    return make_foreignscan(tlist, scan_clauses, baserel->relid, NIL, fdw_private, NIL, NIL, outer_plan);
+}
+
+// --- 2. EXECUTOR: Build the Tuple ---
+static void lsmBeginForeignScan(ForeignScanState *node, int eflags) {
+    LsmFdwState *state = (LsmFdwState *) palloc(sizeof(LsmFdwState));
+    state->already_returned = false;
+    
+    // Deserialize the key we packed in the planner
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    state->search_key = linitial_int(fsplan->fdw_private);
+    
+    node->fdw_state = (void *) state;
+}
+
+static TupleTableSlot *lsmIterateForeignScan(ForeignScanState *node) {
+    LsmFdwState *state = (LsmFdwState *) node->fdw_state;
+    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+    ExecClearTuple(slot);
+
+    // If we already returned the row, tell Postgres the scan is done
+    if (state->already_returned) return slot;
+
+    uint32_t val;
+    bool found = lsm_internal_get((uint32_t)state->search_key, &val);
+
+    if (found) {
+        Datum values[2];
+        bool nulls[2] = {false, false};
+
+        values[0] = Int32GetDatum(state->search_key);
+        values[1] = Int32GetDatum(val);
+
+        // Convert our C variables into a Postgres HeapTuple
+        HeapTuple tuple = heap_form_tuple(slot->tts_tupleDescriptor, values, nulls);
+        ExecStoreHeapTuple(tuple, slot, false);
+    }
+
+    state->already_returned = true;
+    return slot;
+}
+
+static void lsmReScanForeignScan(ForeignScanState *node) {
+    LsmFdwState *state = (LsmFdwState *) node->fdw_state;
+    state->already_returned = false;
+}
+
+static void lsmEndForeignScan(ForeignScanState *node) {
+    // Memory is freed automatically by Postgres context manager
+}
+
+// --- 3. REGISTRATION ---
+PG_FUNCTION_INFO_V1(lsm_fdw_handler);
+Datum lsm_fdw_handler(PG_FUNCTION_ARGS) {
+    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
+    
+    fdwroutine->GetForeignRelSize = lsmGetForeignRelSize;
+    fdwroutine->GetForeignPaths = lsmGetForeignPaths;
+    fdwroutine->GetForeignPlan = lsmGetForeignPlan;
+    fdwroutine->BeginForeignScan = lsmBeginForeignScan;
+    fdwroutine->IterateForeignScan = lsmIterateForeignScan;
+    fdwroutine->ReScanForeignScan = lsmReScanForeignScan;
+    fdwroutine->EndForeignScan = lsmEndForeignScan;
+    
+    PG_RETURN_POINTER(fdwroutine);
 }
 
