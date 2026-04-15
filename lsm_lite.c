@@ -333,6 +333,9 @@ lsm_worker_main(Datum main_arg) {
             if (success)
             {
                 elog(LOG, "LSM Flusher: Successfully wrote %s", filename);
+
+                // --- DELETE THE OBSOLETE WAL ---
+                unlink("lsm_data/wal_immutable.bin");
                 
                 // REBUILD THE FREE LIST IN THE BACKGROUND
                 Manifest->immutable_mem.head_idx = 0;
@@ -373,8 +376,6 @@ lsm_worker_main(Datum main_arg) {
                         break;
                     }
                 }
-                // --- DELETE THE OBSOLETE WAL ---
-                unlink("lsm_data/wal_immutable.bin");
                 // --- SAVE THE MANIFEST TO DISK ---
                 // We write to a temporary file and rename it to prevent corruption 
                 // if the server crashes exactly while writing the manifest.
