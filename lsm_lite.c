@@ -25,14 +25,18 @@ PG_MODULE_MAGIC;
 
 // The Global Manifest 
 typedef struct {
-    int file_counts[MAX_LSM_LEVELS]; // Tracks how many files exist at each level
     bool is_flushing;
+    int file_counts[MAX_LSM_LEVELS]; // Tracks how many files exist at each level
+    int current_wal_gen;  // Tracks WAL rotations
     Latch bgw_latch;       // The signal bell for our background worker
     SkipList active_mem;
     SkipList immutable_mem;
 } LsmManifest;
 
+// Process-local cache (Not in shared memory!)
 static LsmManifest *Manifest = NULL;
+static FILE* local_wal_fp = NULL;
+static int local_wal_gen = -1;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -64,6 +68,8 @@ static void lsm_shmem_startup(void) {
             Manifest->file_counts[i] = 0;
         }
         Manifest->is_flushing = false;
+        Manifest->current_wal_gen = 0;
+
         InitSharedLatch(&Manifest->bgw_latch);
 
         // Pointer math for the two contiguous pools
@@ -186,6 +192,14 @@ retry:
             SkipList temp = Manifest->active_mem;
             Manifest->active_mem = Manifest->immutable_mem;
             Manifest->immutable_mem = temp;
+
+            Manifest->current_wal_gen++;
+
+            // If *this* process has an open file, close it
+            if (local_wal_fp) {
+                fclose(local_wal_fp);
+                local_wal_fp = NULL;
+            }
             
             // The active_mem is already perfectly clean thanks to the BGWorker!
             rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");    
@@ -194,11 +208,23 @@ retry:
         }
     }
 
-    FILE* wal_fp = fopen("lsm_data/wal_active.bin", "ab");
-    if (wal_fp) {
-        fwrite(&key, sizeof(uint32_t), 1, wal_fp);
-        fwrite(&val, sizeof(uint32_t), 1, wal_fp);
-        fclose(wal_fp);
+    // --- CACHED WRITE-AHEAD LOG ---
+    // Invalidate stale file descriptors if another process rotated the WAL
+    if (local_wal_fp != NULL && local_wal_gen != Manifest->current_wal_gen) {
+        fclose(local_wal_fp);
+        local_wal_fp = NULL;
+    }
+
+    // Open file if we don't have one cached
+    if (local_wal_fp == NULL) {
+        local_wal_fp = fopen("lsm_data/wal_active.bin", "ab");
+        local_wal_gen = Manifest->current_wal_gen; // Sync with global generation
+    }
+
+    if (local_wal_fp) {
+        fwrite(&key, sizeof(uint32_t), 1, local_wal_fp);
+        fwrite(&val, sizeof(uint32_t), 1, local_wal_fp);
+        fflush(local_wal_fp); // Push to OS cache immediately!
     }
 
     bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, (uint32_t)val);
@@ -277,6 +303,14 @@ retry:
             SkipList temp = Manifest->active_mem;
             Manifest->active_mem = Manifest->immutable_mem;
             Manifest->immutable_mem = temp;
+
+            Manifest->current_wal_gen++;
+
+            // If *this* process has an open file, close it
+            if (local_wal_fp) {
+                fclose(local_wal_fp);
+                local_wal_fp = NULL;
+            }
             
             rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");
             Manifest->is_flushing = true;
@@ -285,12 +319,23 @@ retry:
     }
 
     // Write Tombstone to WAL
-    FILE* wal_fp = fopen("lsm_data/wal_active.bin", "ab");
-    if (wal_fp) {
+    // --- CACHED WRITE-AHEAD LOG ---
+    // Invalidate stale file descriptors if another process rotated the WAL
+    if (local_wal_fp != NULL && local_wal_gen != Manifest->current_wal_gen) {
+        fclose(local_wal_fp);
+        local_wal_fp = NULL;
+    }
+
+    // Open file if we don't have one cached
+    if (local_wal_fp == NULL) {
+        local_wal_fp = fopen("lsm_data/wal_active.bin", "ab");
+        local_wal_gen = Manifest->current_wal_gen; // Sync with global generation
+    }
+    if (local_wal_fp) {
         uint32_t tombstone = LSM_TOMBSTONE_VAL;
-        fwrite(&key, sizeof(uint32_t), 1, wal_fp);
-        fwrite(&tombstone, sizeof(uint32_t), 1, wal_fp);
-        fclose(wal_fp);
+        fwrite(&key, sizeof(uint32_t), 1, local_wal_fp);
+        fwrite(&tombstone, sizeof(uint32_t), 1, local_wal_fp);
+        fflush(local_wal_fp);
     }
 
     // Insert Tombstone into memory
