@@ -356,7 +356,7 @@ lsm_worker_main(Datum main_arg) {
                     if (sst_compact(current_level, COMPACTION_THRESHOLD, out_idx)) {
                         // Success! Update the manifest.
                         LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
-                        Manifest->file_counts[current_level] = 0; // The 4 old files are gone
+                        Manifest->file_counts[current_level] -= COMPACTION_THRESHOLD; // The 4 old files are gone
                         Manifest->file_counts[current_level + 1]++; // We have 1 new file
                         LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
                         
