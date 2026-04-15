@@ -13,7 +13,7 @@
 
 #include <sys/stat.h> // For mkdir
 
-#define LSM_MAX_NODES 10 // roughly 16MB depending on struct size
+#define LSM_MAX_NODES 20 // roughly 16MB depending on struct size
 #define LSM_MEMTABLE_NODES (LSM_MAX_NODES/2)
 
 PG_MODULE_MAGIC;
@@ -138,21 +138,13 @@ retry:
             pg_usleep(10000); // Sleep for 10ms
             goto retry;
         } else {
-            // THE $O(1)$ SWAP: We swap the structs! 
-            // active_mem now points to the old immutable_pool, and vice versa.
+            // THE $O(1)$ SWAP
             SkipList temp = Manifest->active_mem;
             Manifest->active_mem = Manifest->immutable_mem;
             Manifest->immutable_mem = temp;
-
-            // Reset the NEW active_mem to be perfectly empty
-            Manifest->active_mem.head_idx = 0;
-            Manifest->active_mem.free_head_idx = 1;
-            Manifest->active_mem.current_level = 1;
-            for(int i=0; i<MAX_LEVEL; i++) {
-                Manifest->active_mem.nodes[0].next[i] = LSM_NULL_INDEX;
-            }
             
-            // Trigger the worker
+            // The active_mem is already perfectly clean thanks to the BGWorker!
+            
             Manifest->is_flushing = true;
             SetLatch(&Manifest->bgw_latch);
         }
@@ -190,8 +182,9 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
 static volatile sig_atomic_t got_sigterm = false;
 static void lsm_sigterm(SIGNAL_ARGS) { 
     got_sigterm = true; 
-    // Wake up the worker so it can exit its WaitLatch sleep!
-    SetLatch(MyLatch); 
+    if (Manifest) {
+        SetLatch(&Manifest->bgw_latch); // Wake the correct latch!
+    }
 }
 
 // The main loop for the background worker
@@ -219,6 +212,20 @@ lsm_worker_main(Datum main_arg) {
             if (success) {
                 elog(LOG, "LSM Flusher: Successfully wrote %s", filename);
                 
+                // REBUILD THE FREE LIST IN THE BACKGROUND
+                Manifest->immutable_mem.head_idx = 0;
+                Manifest->immutable_mem.free_head_idx = 1;
+                Manifest->immutable_mem.current_level = 1;
+                
+                for(int i=0; i<MAX_LEVEL; i++) {
+                    Manifest->immutable_mem.nodes[0].next[i] = LSM_NULL_INDEX;
+                }
+                for (int i = 1; i < Manifest->immutable_mem.capacity - 1; i++) {
+                    Manifest->immutable_mem.nodes[i].next[0] = i + 1;
+                }
+                Manifest->immutable_mem.nodes[Manifest->immutable_mem.capacity - 1].next[0] = LSM_NULL_INDEX;
+
+                // Now it is safe to release the backpressure
                 LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
                 Manifest->current_l0_files++;
                 Manifest->is_flushing = false; 
