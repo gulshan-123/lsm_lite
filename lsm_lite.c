@@ -220,6 +220,13 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
 
     bool found = sl_search(&Manifest->active_mem, (uint32_t)key, &val);
 
+    // Search immutable_mem if it has data that hasn't been flushed yet.
+    // is_flushing = true means BGWorker is reading immutable_mem (safe for us to read too)
+    // is_flushing = false means immutable_mem is being rebuilt (empty, skip it)
+    if (!found && Manifest->is_flushing) {
+        found = sl_search(&Manifest->immutable_mem, (uint32_t)key, &val);
+    }
+
     if (!found) {
         // Search Disk: Level by Level, Newest to Oldest
         for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
