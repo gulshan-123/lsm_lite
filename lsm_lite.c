@@ -64,6 +64,7 @@ static void lsm_shmem_startup(void) {
     Manifest = ShmemInitStruct("LsmLiteManifest", total_size, &found);
 
     if (!found) {
+        mkdir("lsm_data", 0700); // Ensure the directory for SSTables and WALs exists
         for (int i = 0; i < MAX_LSM_LEVELS; i++) {
             Manifest->file_counts[i] = 0;
         }
@@ -253,8 +254,7 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
         found = sl_search(&Manifest->immutable_mem, (uint32_t)key, &val);
     }
 
-    LWLockRelease(memtable_lock);
-
+    
     if (!found) {
         // Search Disk: Level by Level, Newest to Oldest
         for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
@@ -269,8 +269,9 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
             }
         }
     }
-
+    
 end_search:
+    LWLockRelease(memtable_lock);
 
     if (found) {
         if (val == LSM_TOMBSTONE_VAL) {
@@ -360,7 +361,6 @@ lsm_worker_main(Datum main_arg) {
     pqsignal(SIGTERM, lsm_sigterm);
     BackgroundWorkerUnblockSignals();
 
-    mkdir("lsm_data", 0700);
     elog(LOG, "LSM Flusher Worker started.");
 
     // Explicitly claim ownership of the latch so we can legally sleep on it.
