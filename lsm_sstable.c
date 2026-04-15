@@ -2,6 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    FILE* fp;
+    uint64_t end_offset;
+    uint32_t current_key;
+    uint32_t current_val;
+    bool eof;
+} MergeStream;
+
+
 
 // Simple FNV-1a Hash for the Bloom Filter
 static uint32_t hash_fnv1a(uint32_t key) {
@@ -180,3 +191,123 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     fclose(fp);
     return found;
 }
+
+bool sst_compact(int target_level, int num_files, int out_idx) {
+    char out_name[256];
+    snprintf(out_name, sizeof(out_name), "lsm_data/L%d_%d.sst", target_level + 1, out_idx);
+    FILE* out_fp = fopen(out_name, "wb");
+    if (!out_fp) return false;
+
+    MergeStream* streams = malloc(num_files * sizeof(MergeStream));
+    
+    // 1. Initialize streams (Open all L0 files)
+    for (int i = 0; i < num_files; i++) {
+        char in_name[256];
+        snprintf(in_name, sizeof(in_name), "lsm_data/L%d_%d.sst", target_level, i);
+        streams[i].fp = fopen(in_name, "rb");
+        
+        // Find where data ends by reading footer
+        fseek(streams[i].fp, -16, SEEK_END);
+        fread(&streams[i].end_offset, sizeof(uint64_t), 1, streams[i].fp);
+        fseek(streams[i].fp, 0, SEEK_SET);
+
+        // Pre-load the first KV pair
+        if (ftell(streams[i].fp) < streams[i].end_offset) {
+            uint32_t len;
+            fread(&len, sizeof(uint32_t), 1, streams[i].fp); // key len
+            fread(&streams[i].current_key, sizeof(uint32_t), 1, streams[i].fp);
+            fread(&len, sizeof(uint32_t), 1, streams[i].fp); // val len
+            fread(&streams[i].current_val, sizeof(uint32_t), 1, streams[i].fp);
+            streams[i].eof = false;
+        } else {
+            streams[i].eof = true;
+        }
+    }
+
+    // Prepare metadata for the output file
+    uint8_t bloom_filter[BLOOM_FILTER_SIZE_BYTES];
+    memset(bloom_filter, 0, BLOOM_FILTER_SIZE_BYTES);
+    
+    int max_sparse = 100000; // Simplified capacity for brevity
+    uint32_t* sparse_keys = malloc(max_sparse * sizeof(uint32_t));
+    uint64_t* sparse_offsets = malloc(max_sparse * sizeof(uint64_t));
+    int sparse_count = 0;
+    int total_count = 0;
+
+    // 2. The K-Way Merge Loop
+    while (true) {
+        // Find the absolute minimum key across all active streams
+        uint32_t min_key = UINT32_MAX;
+        int best_stream = -1;
+
+        for (int i = 0; i < num_files; i++) {
+            if (!streams[i].eof && streams[i].current_key <= min_key) {
+                min_key = streams[i].current_key;
+                // If keys are equal, higher stream index (i) overrides 
+                // because it represents the newer file!
+                best_stream = i; 
+            }
+        }
+
+        if (best_stream == -1) break; // All files are fully read!
+
+        uint32_t final_val = streams[best_stream].current_val;
+
+        // Write to output file
+        uint64_t current_offset = ftell(out_fp);
+        if (total_count % SPARSE_INTERVAL == 0) {
+            sparse_keys[sparse_count] = min_key;
+            sparse_offsets[sparse_count] = current_offset;
+            sparse_count++;
+        }
+        set_bloom_bit(bloom_filter, min_key); // Use your existing helper
+
+        uint32_t len = 4;
+        fwrite(&len, sizeof(uint32_t), 1, out_fp);
+        fwrite(&min_key, sizeof(uint32_t), 1, out_fp);
+        fwrite(&len, sizeof(uint32_t), 1, out_fp);
+        fwrite(&final_val, sizeof(uint32_t), 1, out_fp);
+        total_count++;
+
+        // Advance ALL streams that had this min_key to bypass duplicate/old data
+        for (int i = 0; i < num_files; i++) {
+            if (!streams[i].eof && streams[i].current_key == min_key) {
+                if (ftell(streams[i].fp) < streams[i].end_offset) {
+                    fread(&len, sizeof(uint32_t), 1, streams[i].fp);
+                    fread(&streams[i].current_key, sizeof(uint32_t), 1, streams[i].fp);
+                    fread(&len, sizeof(uint32_t), 1, streams[i].fp);
+                    fread(&streams[i].current_val, sizeof(uint32_t), 1, streams[i].fp);
+                } else {
+                    streams[i].eof = true;
+                }
+            }
+        }
+    }
+
+    // 3. Write Footer exactly as you did in sst_write (Sparse Index, Bloom, Footer)
+    uint64_t sparse_index_offset = ftell(out_fp);
+    fwrite(&sparse_count, sizeof(int), 1, out_fp);
+    for (int i = 0; i < sparse_count; i++) {
+        fwrite(&sparse_keys[i], sizeof(uint32_t), 1, out_fp);
+        fwrite(&sparse_offsets[i], sizeof(uint64_t), 1, out_fp);
+    }
+    uint64_t bloom_filter_offset = ftell(out_fp);
+    fwrite(bloom_filter, sizeof(uint8_t), BLOOM_FILTER_SIZE_BYTES, out_fp);
+    fwrite(&sparse_index_offset, sizeof(uint64_t), 1, out_fp);
+    fwrite(&bloom_filter_offset, sizeof(uint64_t), 1, out_fp);
+
+    // 4. Cleanup and Delete Old Files
+    fclose(out_fp);
+    for (int i = 0; i < num_files; i++) {
+        fclose(streams[i].fp);
+        char in_name[256];
+        snprintf(in_name, sizeof(in_name), "lsm_data/L%d_%d.sst", target_level, i);
+        unlink(in_name); // DELETE old file
+    }
+    
+    free(streams);
+    free(sparse_keys);
+    free(sparse_offsets);
+    return true;
+}
+

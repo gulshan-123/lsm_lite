@@ -15,12 +15,14 @@
 
 #define LSM_MAX_NODES 20 // roughly 16MB depending on struct size
 #define LSM_MEMTABLE_NODES (LSM_MAX_NODES/2)
+#define MAX_LSM_LEVELS 10
+#define COMPACTION_THRESHOLD 4
 
 PG_MODULE_MAGIC;
 
 // The Global Manifest 
 typedef struct {
-    int current_l0_files;
+    int file_counts[MAX_LSM_LEVELS]; // Tracks how many files exist at each level
     bool is_flushing;
     Latch bgw_latch;       // The signal bell for our background worker
     SkipList active_mem;
@@ -55,7 +57,9 @@ static void lsm_shmem_startup(void) {
     Manifest = ShmemInitStruct("LsmLiteManifest", total_size, &found);
 
     if (!found) {
-        Manifest->current_l0_files = 0;
+        for (int i = 0; i < MAX_LSM_LEVELS; i++) {
+            Manifest->file_counts[i] = 0;
+        }
         Manifest->is_flushing = false;
         InitSharedLatch(&Manifest->bgw_latch);
 
@@ -169,6 +173,22 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
 
     bool found = sl_search(&Manifest->active_mem, (uint32_t)key, &val);
 
+    if (!found) {
+        // Search Disk: Level by Level, Newest to Oldest
+        for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
+            for (int idx = Manifest->file_counts[lvl] - 1; idx >= 0; idx--) {
+                char filename[256];
+                snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
+                
+                if (sst_read(filename, (uint32_t)key, &val)) {
+                    found = true;
+                    goto end_search; // Break out of nested loops
+                }
+            }
+        }
+    }
+
+end_search:
     LWLockRelease(memtable_lock);
 
     if (found) {
@@ -205,11 +225,12 @@ lsm_worker_main(Datum main_arg) {
 
         if (Manifest->is_flushing) {
             char filename[256];
-            snprintf(filename, sizeof(filename), "lsm_data/L0_%d.sst", Manifest->current_l0_files);
+            snprintf(filename, sizeof(filename), "lsm_data/L0_%d.sst", Manifest->file_counts[0]);
 
             bool success = sst_write(&Manifest->immutable_mem, filename);
 
-            if (success) {
+            if (success)
+            {
                 elog(LOG, "LSM Flusher: Successfully wrote %s", filename);
                 
                 // REBUILD THE FREE LIST IN THE BACKGROUND
@@ -227,10 +248,33 @@ lsm_worker_main(Datum main_arg) {
 
                 // Now it is safe to release the backpressure
                 LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
-                Manifest->current_l0_files++;
+                Manifest->file_counts[0]++; // Increment L0 count
                 Manifest->is_flushing = false; 
                 LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
-            } else {
+                
+                // === THE CASCADING COMPACTION TRIGGER ===
+                int current_level = 0;
+                while (Manifest->file_counts[current_level] >= COMPACTION_THRESHOLD) {
+                    elog(LOG, "LSM Compaction: Triggering Level %d -> Level %d", current_level, current_level + 1);
+                    
+                    int out_idx = Manifest->file_counts[current_level + 1];
+                    
+                    if (sst_compact(current_level, COMPACTION_THRESHOLD, out_idx)) {
+                        // Success! Update the manifest.
+                        LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
+                        Manifest->file_counts[current_level] = 0; // The 4 old files are gone
+                        Manifest->file_counts[current_level + 1]++; // We have 1 new file
+                        LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
+                        
+                        current_level++; // Loop again to see if L1 -> L2 is needed!
+                    } else {
+                        elog(ERROR, "LSM Compaction Failed!");
+                        break;
+                    }
+                }
+            } 
+            else 
+            {
                 elog(ERROR, "LSM Flusher: Failed to write %s", filename);
             }
         }
