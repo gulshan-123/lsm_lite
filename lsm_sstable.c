@@ -227,8 +227,15 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
     // Prepare metadata for the output file
     uint8_t bloom_filter[BLOOM_FILTER_SIZE_BYTES];
     memset(bloom_filter, 0, BLOOM_FILTER_SIZE_BYTES);
+    uint64_t total_data_bytes = 0;
+    for (int i = 0; i < num_files; i++) {
+        total_data_bytes += streams[i].end_offset; // end_offset = start of sparse index = end of data
+    }
+
+    // Each KV record is exactly 16 bytes (4+4+4+4)
+    uint64_t max_records = total_data_bytes / 16;
+    size_t max_sparse = (size_t)(max_records / SPARSE_INTERVAL) + 1;
     
-    int max_sparse = 100000; // Simplified capacity for brevity
     uint32_t* sparse_keys = malloc(max_sparse * sizeof(uint32_t));
     uint64_t* sparse_offsets = malloc(max_sparse * sizeof(uint64_t));
     int sparse_count = 0;
