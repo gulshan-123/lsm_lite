@@ -46,6 +46,9 @@ static LsmManifest *Manifest = NULL;
 static FILE* local_wal_fp = NULL;
 static int local_wal_gen = -1;
 
+// since we focused only on point updates (hack for delete)
+static int32 current_query_key = -1;
+
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
@@ -325,6 +328,49 @@ end_search:
     }
 }
 
+/* Shared logic for both UDFs and FDW */
+bool lsm_internal_put(uint32_t key, uint32_t val) {
+    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
+    LWLock *memtable_lock = &lock_array[0].lock;
+
+retry:
+    LWLockAcquire(memtable_lock, LW_EXCLUSIVE);
+
+    if (Manifest->active_mem.free_head_idx == LSM_NULL_INDEX) {
+        if (Manifest->is_flushing) {
+            LWLockRelease(memtable_lock);
+            pg_usleep(10000);
+            goto retry;
+        } else {
+            /* Swap Active/Immutable */
+            SkipList temp = Manifest->active_mem;
+            Manifest->active_mem = Manifest->immutable_mem;
+            Manifest->immutable_mem = temp;
+            Manifest->current_wal_gen++;
+            if (local_wal_fp) { fclose(local_wal_fp); local_wal_fp = NULL; }
+            rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");
+            Manifest->is_flushing = true;
+            SetLatch(&Manifest->bgw_latch);
+        }
+    }
+
+    /* WAL Write */
+    if (local_wal_fp == NULL || local_wal_gen != Manifest->current_wal_gen) {
+        if (local_wal_fp) fclose(local_wal_fp);
+        local_wal_fp = fopen("lsm_data/wal_active.bin", "ab");
+        local_wal_gen = Manifest->current_wal_gen;
+    }
+    if (local_wal_fp) {
+        fwrite(&key, sizeof(uint32_t), 1, local_wal_fp);
+        fwrite(&val, sizeof(uint32_t), 1, local_wal_fp);
+        fflush(local_wal_fp);
+    }
+
+    bool success = sl_insert(&Manifest->active_mem, key, val);
+    LWLockRelease(memtable_lock);
+    return success;
+}
+
 Datum lsm_delete(PG_FUNCTION_ARGS) {
     int32 key = PG_GETARG_INT32(0);
 
@@ -558,6 +604,8 @@ static void lsmBeginForeignScan(ForeignScanState *node, int eflags) {
     // Deserialize the key we packed in the planner
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
     state->search_key = linitial_int(fsplan->fdw_private);
+
+    current_query_key = state->search_key;
     
     node->fdw_state = (void *) state;
 }
@@ -599,11 +647,55 @@ static void lsmEndForeignScan(ForeignScanState *node) {
     // Memory is freed automatically by Postgres context manager
 }
 
+/* Mandatory for DML support: Tells Postgres which columns are needed */
+static void lsmAddForeignUpdateTargets(Query *parsetree, RangeTblEntry *target_rte, Relation target_relation) {
+    /* No special targets needed for LSM point-ops */
+}
+
+static List *lsmPlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelation, int subplan_index) {
+    return NIL;
+}
+
+static void lsmBeginForeignModify(ModifyTableState *mtstate, ResultRelInfo *rinfo, List *fdw_private, int subplan_index, int eflags) {
+    /* No per-query state needed for writes */
+}
+
+static TupleTableSlot *lsmExecForeignInsert(EState *estate, ResultRelInfo *rinfo, TupleTableSlot *slot, TupleTableSlot *planSlot) {
+    bool isnull;
+    /* Extract 'key' (attr 1) and 'val' (attr 2) from the slot */
+    Datum key_datum = slot_getattr(slot, 1, &isnull);
+    Datum val_datum = slot_getattr(slot, 2, &isnull);
+
+    if (!lsm_internal_put(DatumGetUInt32(key_datum), DatumGetUInt32(val_datum)))
+        ereport(ERROR, (errmsg("LSM-Lite: Insert failed (MemTable full/System error)")));
+
+    return slot;
+}
+
+static TupleTableSlot *lsmExecForeignDelete(EState *estate, ResultRelInfo *rinfo, TupleTableSlot *slot, TupleTableSlot *planSlot) {
+    bool isnull;
+    /* In LSM, Delete is just an Insert with a Tombstone */
+    if (!lsm_internal_put(DatumGetUInt32(current_query_key), LSM_TOMBSTONE_VAL))
+        ereport(ERROR, (errmsg("LSM-Lite: Delete failed")));
+
+    return slot;
+}
+
+static TupleTableSlot *lsmExecForeignUpdate(EState *estate, ResultRelInfo *rinfo, TupleTableSlot *slot, TupleTableSlot *planSlot) {
+    /* In LSM, Update is exactly the same as Insert */
+    return lsmExecForeignInsert(estate, rinfo, slot, planSlot);
+}
+
+static void lsmEndForeignModify(EState *estate, ResultRelInfo *rinfo) {
+    /* Cleanup */
+}
+
 // --- 3. REGISTRATION ---
 PG_FUNCTION_INFO_V1(lsm_fdw_handler);
 Datum lsm_fdw_handler(PG_FUNCTION_ARGS) {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
     
+    /* Read Path Callbacks */
     fdwroutine->GetForeignRelSize = lsmGetForeignRelSize;
     fdwroutine->GetForeignPaths = lsmGetForeignPaths;
     fdwroutine->GetForeignPlan = lsmGetForeignPlan;
@@ -611,6 +703,15 @@ Datum lsm_fdw_handler(PG_FUNCTION_ARGS) {
     fdwroutine->IterateForeignScan = lsmIterateForeignScan;
     fdwroutine->ReScanForeignScan = lsmReScanForeignScan;
     fdwroutine->EndForeignScan = lsmEndForeignScan;
+
+    /* Write Path Callbacks */
+    fdwroutine->AddForeignUpdateTargets = lsmAddForeignUpdateTargets;
+    fdwroutine->PlanForeignModify = lsmPlanForeignModify;
+    fdwroutine->BeginForeignModify = lsmBeginForeignModify;
+    fdwroutine->ExecForeignInsert = lsmExecForeignInsert;
+    fdwroutine->ExecForeignUpdate = lsmExecForeignUpdate;
+    fdwroutine->ExecForeignDelete = lsmExecForeignDelete;
+    fdwroutine->EndForeignModify = lsmEndForeignModify;
     
     PG_RETURN_POINTER(fdwroutine);
 }
