@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 typedef struct {
     FILE* fp;
@@ -62,10 +65,12 @@ bool sst_write(SkipList* list, const char* filename) {
     uint8_t* bloom_filter = calloc(bloom_bytes, 1);
 
     // Dynamic array for sparse index. Capacity / interval + 1 is the max possible entries.
-    int max_sparse_entries = (list->capacity / SPARSE_INTERVAL) + 1;
+    int max_sparse_entries = ((list->capacity * 16) / BLOCK_SIZE) + 2;
     uint32_t* sparse_keys = malloc(max_sparse_entries * sizeof(uint32_t));
     uint64_t* sparse_offsets = malloc(max_sparse_entries * sizeof(uint64_t));
+    
     int sparse_count = 0;
+    uint64_t last_block_offset = 0;
 
     int total_count = 0;
 
@@ -75,11 +80,12 @@ bool sst_write(SkipList* list, const char* filename) {
         uint32_t val = list->nodes[current].value;
         uint64_t current_offset = ftell(fp);
 
-        // Record sparse index entry
-        if (total_count % SPARSE_INTERVAL == 0) {
+        // Force the first key, or record if we crossed 4096 bytes
+        if (sparse_count == 0 || (current_offset - last_block_offset) >= BLOCK_SIZE) {
             sparse_keys[sparse_count] = key;
             sparse_offsets[sparse_count] = current_offset;
             sparse_count++;
+            last_block_offset = current_offset; // Reset the 4KB tracker
         }
 
         // Populate Bloom Filter
@@ -120,124 +126,94 @@ bool sst_write(SkipList* list, const char* filename) {
 }
 
 bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
-    FILE* fp = fopen(filename, "rb");
-    if (!fp) return false;
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) return false;
 
-    // === 1. DEFEND AGAINST TRUNCATED FILES ===
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    if (file_size < 20) {
-        fclose(fp);
-        return false; // Safely ignore corrupted file
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 20) {
+        close(fd);
+        return false;
+    }
+    size_t file_size = st.st_size;
+
+    // === 1. MEMORY MAP THE ENTIRE FILE (ZERO-COPY) ===
+    uint8_t* map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return false;
     }
 
-    // === 2. SAFE FOOTER READ ===
-    fseek(fp, -20, SEEK_END);
+    // === 2. SAFE FOOTER PARSING (Pointer Math) ===
     uint64_t sparse_offset, bloom_offset;
     uint32_t bloom_bytes;
-    
-    // Ensure we actually read all 3 items successfully
-    if (fread(&sparse_offset, sizeof(uint64_t), 1, fp) != 1 ||
-        fread(&bloom_offset, sizeof(uint64_t), 1, fp) != 1 ||
-        fread(&bloom_bytes, sizeof(uint32_t), 1, fp) != 1) {
-        fclose(fp);
-        return false;
-    }
+    memcpy(&sparse_offset, map + file_size - 20, sizeof(uint64_t));
+    memcpy(&bloom_offset, map + file_size - 12, sizeof(uint64_t));
+    memcpy(&bloom_bytes, map + file_size - 4, sizeof(uint32_t));
 
-    uint8_t* bloom_filter = malloc(bloom_bytes);
-    if (!bloom_filter) { // Defend against bad allocation
-        fclose(fp);
-        return false;
-    }
-    // 2. CHECK BLOOM FILTER (In RAM)
-    fseek(fp, bloom_offset, SEEK_SET);
-    if (fread(bloom_filter, sizeof(uint8_t), bloom_bytes, fp) != bloom_bytes) {
-        free(bloom_filter);
-        fclose(fp);
-        return false;
-    }
-
+    // === 3. ZERO-COPY BLOOM CHECK ===
+    uint8_t* bloom_filter = map + bloom_offset;
     uint32_t num_bits = bloom_bytes * 8;
-    bool might_exist = bloom_check(bloom_filter, num_bits, search_key);
-    free(bloom_filter);
-    
-    if (!might_exist) {
-        // The magic of LSM: We saved a heavy disk search because the filter said no.
-        fclose(fp);
-        return false; 
+    if (!bloom_check(bloom_filter, num_bits, search_key)) {
+        munmap(map, file_size);
+        close(fd);
+        return false;
     }
 
-    // 3. LOAD & BINARY SEARCH SPARSE INDEX
-    fseek(fp, sparse_offset, SEEK_SET);
+    // === 4. ZERO-COPY SPARSE INDEX BINARY SEARCH ===
     int sparse_count;
-    if (fread(&sparse_count, sizeof(int), 1, fp) != 1 || sparse_count <= 0) {
-        fclose(fp);
-        return false;
-    }
+    memcpy(&sparse_count, map + sparse_offset, sizeof(int));
     
-    uint32_t* sparse_keys = malloc(sparse_count * sizeof(uint32_t));
-    uint64_t* sparse_offsets = malloc(sparse_count * sizeof(uint64_t));
+    // The interleaved array starts right after the count
+    uint8_t* index_ptr = map + sparse_offset + sizeof(int); 
     
-    if (!sparse_keys || !sparse_offsets) {
-        if (sparse_keys) free(sparse_keys);
-        if (sparse_offsets) free(sparse_offsets);
-        fclose(fp);
-        return false;
-    }
-
-    // FIX: Read interleaved exactly as it was written
-    for (int i = 0; i < sparse_count; i++) {
-        if (fread(&sparse_keys[i], sizeof(uint32_t), 1, fp) != 1 ||
-            fread(&sparse_offsets[i], sizeof(uint64_t), 1, fp) != 1) {
-            free(sparse_keys);
-            free(sparse_offsets);
-            fclose(fp);
-            return false;
-        }
-    }
-
-    // Find the largest sparse key that is <= search_key
     int left = 0, right = sparse_count - 1;
     int best_idx = 0;
     while (left <= right) {
         int mid = left + (right - left) / 2;
-        if (sparse_keys[mid] == search_key) {
+        uint32_t mid_key;
+        // Key is at offset 0, Size is 4. Total record size is 12 (4 key + 8 offset).
+        memcpy(&mid_key, index_ptr + (mid * 12), sizeof(uint32_t)); 
+
+        if (mid_key == search_key) {
             best_idx = mid;
-            break; // Exact match in index
-        } else if (sparse_keys[mid] < search_key) {
-            best_idx = mid; 
+            break;
+        } else if (mid_key < search_key) {
+            best_idx = mid;
             left = mid + 1;
         } else {
             right = mid - 1;
         }
     }
 
-    // 4. EXACT DISK SEEK & LINEAR SCAN
-    fseek(fp, sparse_offsets[best_idx], SEEK_SET);
-    uint64_t end_of_data = sparse_offset; // Data blocks stop where sparse index begins
+    // Extract the block offset for our best match
+    uint64_t data_offset;
+    memcpy(&data_offset, index_ptr + (best_idx * 12) + 4, sizeof(uint64_t));
+
+    // === 5. ZERO-COPY DATA SCAN ===
+    uint64_t end_of_data = sparse_offset;
+    uint8_t* data_ptr = map + data_offset;
     bool found = false;
 
-    while (ftell(fp) < end_of_data) {
-        uint32_t klen, k, vlen, v;
-        if (fread(&klen, sizeof(uint32_t), 1, fp) != 1) break;
-        fread(&k, sizeof(uint32_t), 1, fp);
-        fread(&vlen, sizeof(uint32_t), 1, fp);
-        fread(&v, sizeof(uint32_t), 1, fp);
-
+    // Scan the 4KB block directly in the memory-mapped space
+    while (data_ptr < map + end_of_data) {
+        uint32_t k;
+        // Skip 4-byte KeyLen, read Key
+        memcpy(&k, data_ptr + 4, sizeof(uint32_t));
+        
         if (k == search_key) {
-            *out_value = v;
+            // Skip 4-byte KeyLen + 4-byte Key + 4-byte ValLen, read Val
+            memcpy(out_value, data_ptr + 12, sizeof(uint32_t));
             found = true;
             break;
         }
-        if (k > search_key) {
-            // Because the file is perfectly sorted, if we pass the key, it doesn't exist.
-            break; 
-        }
+        if (k > search_key) break;
+        
+        data_ptr += 16; // Advance to the next 16-byte record
     }
 
-    free(sparse_keys);
-    free(sparse_offsets);
-    fclose(fp);
+    // === 6. CLEANUP ===
+    munmap(map, file_size); // Instantly releases the mapping
+    close(fd);
     return found;
 }
 
@@ -289,12 +265,12 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
     }
 
     // Each KV record is exactly 16 bytes (4+4+4+4)
-    uint64_t max_records = total_data_bytes / 16;
-    size_t max_sparse = (size_t)(max_records / SPARSE_INTERVAL) + 1;
-    
+    size_t max_sparse = (total_data_bytes / BLOCK_SIZE) + 2;
     uint32_t* sparse_keys = malloc(max_sparse * sizeof(uint32_t));
     uint64_t* sparse_offsets = malloc(max_sparse * sizeof(uint64_t));
+    
     int sparse_count = 0;
+    uint64_t last_block_offset = 0;
     int total_count = 0;
 
     // 2. The K-Way Merge Loop
@@ -318,10 +294,11 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
 
         // Write to output file
         uint64_t current_offset = ftell(out_fp);
-        if (total_count % SPARSE_INTERVAL == 0) {
+        if (sparse_count == 0 || (current_offset - last_block_offset) >= BLOCK_SIZE) {
             sparse_keys[sparse_count] = min_key;
             sparse_offsets[sparse_count] = current_offset;
             sparse_count++;
+            last_block_offset = current_offset;
         }
         bloom_add(bloom_filter, num_bits, min_key); // Use your existing helper
 

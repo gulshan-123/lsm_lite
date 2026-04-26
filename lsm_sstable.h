@@ -5,8 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define BLOOM_FILTER_SIZE_BYTES 4096
-#define SPARSE_INTERVAL 16  // Record an index entry every 16 keys
+#define BLOCK_SIZE 4096
 
 // Writes the in-memory Skip List to a perfectly formatted binary SSTable.
 bool sst_write(SkipList* list, const char* filename);
