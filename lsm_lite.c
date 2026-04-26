@@ -470,6 +470,8 @@ lsm_worker_main(Datum main_arg) {
                 unlink("lsm_data/wal_immutable.bin");
                 
                 // REBUILD THE FREE LIST IN THE BACKGROUND
+                LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
+
                 Manifest->immutable_mem.head_idx = 0;
                 Manifest->immutable_mem.free_head_idx = 1;
                 Manifest->immutable_mem.current_level = 1;
@@ -483,7 +485,6 @@ lsm_worker_main(Datum main_arg) {
                 Manifest->immutable_mem.nodes[Manifest->immutable_mem.capacity - 1].next[0] = LSM_NULL_INDEX;
 
                 // Now it is safe to release the backpressure
-                LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
                 Manifest->file_counts[0]++; // Increment L0 count
                 Manifest->is_flushing = false; 
                 LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
