@@ -20,8 +20,9 @@
 #include "access/htup_details.h"
 
 #include <sys/stat.h> // For mkdir
+#include <unistd.h>   // For unlink
 
-#define LSM_MAX_NODES 20 // roughly 16MB depending on struct size
+#define LSM_MAX_NODES 1000 // roughly 16MB depending on struct size
 #define LSM_MEMTABLE_NODES (LSM_MAX_NODES/2)
 #define MAX_LSM_LEVELS 10
 #define COMPACTION_THRESHOLD 4
@@ -245,34 +246,48 @@ retry:
     PG_RETURN_BOOL(success);
 }
 
-// Put this above your SQL functions
 bool lsm_internal_get(uint32_t key, uint32_t *out_val) {
     bool found = false;
     LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
     LWLock *memtable_lock = &lock_array[0].lock; 
+    
+    // We snapshot the manifest state so we can read disk without locking
+    int local_file_counts[MAX_LSM_LEVELS];
 
-    // Memory Search
+retry_search:
+    // 1. Grab lock ONLY to search memory and copy metadata
     LWLockAcquire(memtable_lock, LW_SHARED);
+    
     found = sl_search(&Manifest->active_mem, key, out_val);
     if (!found && Manifest->is_flushing)
         found = sl_search(&Manifest->immutable_mem, key, out_val);
         
-    // Disk Search (Thread-Safe)
+    for (int i = 0; i < MAX_LSM_LEVELS; i++) {
+        local_file_counts[i] = Manifest->file_counts[i];
+    }
+    LWLockRelease(memtable_lock); 
+
+    // 2. Search Disk (Thread-Safe & Lock-Free)
     if (!found) {
         for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
-            for (int idx = Manifest->file_counts[lvl] - 1; idx >= 0; idx--) {
+            for (int idx = local_file_counts[lvl] - 1; idx >= 0; idx--) {
                 char filename[256];
                 snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
+                
                 if (sst_read(filename, key, out_val)) {
                     found = true;
                     goto end_search; 
+                } else if (access(filename, F_OK) != 0) {
+                    // OPTIMISTIC ABORT!
+                    // sst_read failed because the background worker deleted this file 
+                    // mid-compaction. The tree shape changed. Restart the search!
+                    goto retry_search;
                 }
             }
         }
     }
     
 end_search:
-    LWLockRelease(memtable_lock);
     if (found && *out_val == LSM_TOMBSTONE_VAL) return false;
     return found;
 }
@@ -282,47 +297,45 @@ Datum lsm_get(PG_FUNCTION_ARGS) {
     uint32_t val;
 
     LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
-    // Use Lock 0 as the global MemTable Read Lock
     LWLock *memtable_lock = &lock_array[0].lock; 
+    
+    int local_file_counts[MAX_LSM_LEVELS];
 
-    // Acquire SHARED lock. Multiple SELECTs can read simultaneously!
+retry_search:
     LWLockAcquire(memtable_lock, LW_SHARED);
 
     bool found = sl_search(&Manifest->active_mem, (uint32_t)key, &val);
-
-    // Search immutable_mem if it has data that hasn't been flushed yet.
-    // is_flushing = true means BGWorker is reading immutable_mem (safe for us to read too)
-    // is_flushing = false means immutable_mem is being rebuilt (empty, skip it)
     if (!found && Manifest->is_flushing) {
         found = sl_search(&Manifest->immutable_mem, (uint32_t)key, &val);
     }
-
     
+    for (int i = 0; i < MAX_LSM_LEVELS; i++) {
+        local_file_counts[i] = Manifest->file_counts[i];
+    }
+
+    LWLockRelease(memtable_lock);
+
     if (!found) {
-        // Search Disk: Level by Level, Newest to Oldest
         for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
-            for (int idx = Manifest->file_counts[lvl] - 1; idx >= 0; idx--) {
+            for (int idx = local_file_counts[lvl] - 1; idx >= 0; idx--) {
                 char filename[256];
                 snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
                 
                 if (sst_read(filename, (uint32_t)key, &val)) {
                     found = true;
-                    goto end_search; // Break out of nested loops
+                    goto end_search; 
+                } else if (access(filename, F_OK) != 0) {
+                    // File deleted mid-flight by compaction. Restart!
+                    goto retry_search;
                 }
             }
         }
     }
     
 end_search:
-    LWLockRelease(memtable_lock);
-
     if (found) {
-        if (val == LSM_TOMBSTONE_VAL) {
-            // We found the key, but it's a Tombstone! It has been deleted.
-            PG_RETURN_NULL();
-        } else {
-            PG_RETURN_INT32((int32)val);
-        }
+        if (val == LSM_TOMBSTONE_VAL) PG_RETURN_NULL();
+        else PG_RETURN_INT32((int32)val);
     } else {
         PG_RETURN_NULL();
     }
