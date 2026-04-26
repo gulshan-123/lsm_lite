@@ -502,6 +502,12 @@ lsm_worker_main(Datum main_arg) {
                         Manifest->file_counts[current_level] -= COMPACTION_THRESHOLD; // The 4 old files are gone
                         Manifest->file_counts[current_level + 1]++; // We have 1 new file
                         LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
+
+                        for (int i = 0; i < COMPACTION_THRESHOLD; i++) {
+                            char old_file[256];
+                            snprintf(old_file, sizeof(old_file), "lsm_data/L%d_%d.sst", current_level, i);
+                            unlink(old_file);
+                        }
                         
                         current_level++; // Loop again to see if L1 -> L2 is needed!
                     } else {

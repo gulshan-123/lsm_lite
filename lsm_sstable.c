@@ -58,6 +58,7 @@ bool sst_write(SkipList* list, const char* filename) {
     uint32_t max_keys = list->capacity; 
     uint32_t num_bits = max_keys * 10;
     uint32_t bloom_bytes = (num_bits + 7) / 8;
+    num_bits = bloom_bytes * 8;
     uint8_t* bloom_filter = calloc(bloom_bytes, 1);
 
     // Dynamic array for sparse index. Capacity / interval + 1 is the max possible entries.
@@ -280,6 +281,7 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
     uint32_t estimated_keys = (total_input_size / 16) + 1000; // +1000 safety buffer
     uint32_t num_bits = estimated_keys * 10;
     uint32_t bloom_bytes = (num_bits + 7) / 8;
+    num_bits = bloom_bytes * 8;
     uint8_t* bloom_filter = calloc(bloom_bytes, 1);
     uint64_t total_data_bytes = 0;
     for (int i = 0; i < num_files; i++) {
@@ -362,9 +364,6 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
     fclose(out_fp);
     for (int i = 0; i < num_files; i++) {
         fclose(streams[i].fp);
-        char in_name[256];
-        snprintf(in_name, sizeof(in_name), "lsm_data/L%d_%d.sst", target_level, i);
-        unlink(in_name); // DELETE old file
     }
     free(bloom_filter);
     free(streams);
