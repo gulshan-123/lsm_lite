@@ -121,6 +121,7 @@ bool sst_write(SkipList* list, const char* filename) {
 
     free(sparse_keys);
     free(sparse_offsets);
+    free(bloom_filter);
     fclose(fp);
     return true;
 }

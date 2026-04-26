@@ -169,7 +169,7 @@ void _PG_init(void) {
     MemSet(&worker, 0, sizeof(BackgroundWorker));
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    worker.bgw_restart_time = 5; // Restart after 5 seconds if it crashes
     sprintf(worker.bgw_library_name, "lsm_lite");
     sprintf(worker.bgw_function_name, "lsm_worker_main");
     sprintf(worker.bgw_name, "LSM Flusher Worker");
