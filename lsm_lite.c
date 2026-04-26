@@ -74,7 +74,11 @@ static void lsm_shmem_startup(void) {
     Size total_size = sizeof(LsmManifest) + (2 * LSM_MEMTABLE_NODES * sizeof(SkipNode));
     Manifest = ShmemInitStruct("LsmLiteManifest", total_size, &found);
 
-    if (!found) {
+    if (found) {
+        Manifest->active_mem.nodes    = (SkipNode*)((char*)Manifest + sizeof(LsmManifest));
+        Manifest->immutable_mem.nodes = Manifest->active_mem.nodes + LSM_MEMTABLE_NODES;
+    } 
+    else { /* !found */
         mkdir("lsm_data", 0700); // Ensure the directory for SSTables and WALs exists
         for (int i = 0; i < MAX_LSM_LEVELS; i++) {
             Manifest->file_counts[i] = 0;
