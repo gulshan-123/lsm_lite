@@ -122,17 +122,39 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     FILE* fp = fopen(filename, "rb");
     if (!fp) return false;
 
-    // 1. READ FOOTER
+    // === 1. DEFEND AGAINST TRUNCATED FILES ===
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    if (file_size < 20) {
+        fclose(fp);
+        return false; // Safely ignore corrupted file
+    }
+
+    // === 2. SAFE FOOTER READ ===
     fseek(fp, -20, SEEK_END);
-    uint64_t sparse_offset, bloom_offset, bloom_bytes;
-    fread(&sparse_offset, sizeof(uint64_t), 1, fp);
-    fread(&bloom_offset, sizeof(uint64_t), 1, fp);
-    fread(&bloom_bytes, sizeof(uint32_t), 1, fp);
+    uint64_t sparse_offset, bloom_offset;
+    uint32_t bloom_bytes;
+    
+    // Ensure we actually read all 3 items successfully
+    if (fread(&sparse_offset, sizeof(uint64_t), 1, fp) != 1 ||
+        fread(&bloom_offset, sizeof(uint64_t), 1, fp) != 1 ||
+        fread(&bloom_bytes, sizeof(uint32_t), 1, fp) != 1) {
+        fclose(fp);
+        return false;
+    }
 
     uint8_t* bloom_filter = malloc(bloom_bytes);
+    if (!bloom_filter) { // Defend against bad allocation
+        fclose(fp);
+        return false;
+    }
     // 2. CHECK BLOOM FILTER (In RAM)
     fseek(fp, bloom_offset, SEEK_SET);
-    fread(bloom_filter, sizeof(uint8_t), bloom_bytes, fp);
+    if (fread(bloom_filter, sizeof(uint8_t), bloom_bytes, fp) != bloom_bytes) {
+        free(bloom_filter);
+        fclose(fp);
+        return false;
+    }
 
     uint32_t num_bits = bloom_bytes * 8;
     bool might_exist = bloom_check(bloom_filter, num_bits, search_key);
@@ -147,15 +169,30 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     // 3. LOAD & BINARY SEARCH SPARSE INDEX
     fseek(fp, sparse_offset, SEEK_SET);
     int sparse_count;
-    fread(&sparse_count, sizeof(int), 1, fp);
+    if (fread(&sparse_count, sizeof(int), 1, fp) != 1 || sparse_count <= 0) {
+        fclose(fp);
+        return false;
+    }
     
     uint32_t* sparse_keys = malloc(sparse_count * sizeof(uint32_t));
     uint64_t* sparse_offsets = malloc(sparse_count * sizeof(uint64_t));
     
+    if (!sparse_keys || !sparse_offsets) {
+        if (sparse_keys) free(sparse_keys);
+        if (sparse_offsets) free(sparse_offsets);
+        fclose(fp);
+        return false;
+    }
+
     // FIX: Read interleaved exactly as it was written
     for (int i = 0; i < sparse_count; i++) {
-        fread(&sparse_keys[i], sizeof(uint32_t), 1, fp);
-        fread(&sparse_offsets[i], sizeof(uint64_t), 1, fp);
+        if (fread(&sparse_keys[i], sizeof(uint32_t), 1, fp) != 1 ||
+            fread(&sparse_offsets[i], sizeof(uint64_t), 1, fp) != 1) {
+            free(sparse_keys);
+            free(sparse_offsets);
+            fclose(fp);
+            return false;
+        }
     }
 
     // Find the largest sparse key that is <= search_key
@@ -181,7 +218,7 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
 
     while (ftell(fp) < end_of_data) {
         uint32_t klen, k, vlen, v;
-        fread(&klen, sizeof(uint32_t), 1, fp);
+        if (fread(&klen, sizeof(uint32_t), 1, fp) != 1) break;
         fread(&k, sizeof(uint32_t), 1, fp);
         fread(&vlen, sizeof(uint32_t), 1, fp);
         fread(&v, sizeof(uint32_t), 1, fp);
