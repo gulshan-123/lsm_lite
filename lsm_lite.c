@@ -27,8 +27,7 @@
 #define MAX_LSM_LEVELS 10
 #define COMPACTION_THRESHOLD 4
 
-// Use the maximum positive 32-bit integer as the delete marker
-#define LSM_TOMBSTONE_VAL 2147483647
+#define LSM_TOMBSTONE_VAL 0xFFFFFFFFu // // UINT32_MAX — unreachable as a SQL integer
 
 PG_MODULE_MAGIC;
 
