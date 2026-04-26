@@ -183,67 +183,8 @@ PG_FUNCTION_INFO_V1(lsm_get);
 PG_FUNCTION_INFO_V1(lsm_delete);
 
 Datum lsm_put(PG_FUNCTION_ARGS) {
-    int32 key = PG_GETARG_INT32(0);
-    int32 val = PG_GETARG_INT32(1);
-
-    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
-    LWLock *memtable_lock = &lock_array[0].lock; 
-
-retry:
-    LWLockAcquire(memtable_lock, LW_EXCLUSIVE);
-
-    // CHECK CAPACITY: Is the Active MemTable full?
-    if (Manifest->active_mem.free_head_idx == LSM_NULL_INDEX) {
-        if (Manifest->is_flushing) {
-            // COMPACTION STALL: The background worker hasn't finished writing 
-            // the previous MemTable to disk. We MUST wait to avoid memory corruption.
-            LWLockRelease(memtable_lock);
-            pg_usleep(10000); // Sleep for 10ms
-            goto retry;
-        } else {
-            // THE $O(1)$ SWAP
-            SkipList temp = Manifest->active_mem;
-            Manifest->active_mem = Manifest->immutable_mem;
-            Manifest->immutable_mem = temp;
-
-            Manifest->current_wal_gen++;
-
-            // If *this* process has an open file, close it
-            if (local_wal_fp) {
-                fclose(local_wal_fp);
-                local_wal_fp = NULL;
-            }
-            
-            // The active_mem is already perfectly clean thanks to the BGWorker!
-            rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");    
-            Manifest->is_flushing = true;
-            SetLatch(&Manifest->bgw_latch);
-        }
-    }
-
-    // --- CACHED WRITE-AHEAD LOG ---
-    // Invalidate stale file descriptors if another process rotated the WAL
-    if (local_wal_fp != NULL && local_wal_gen != Manifest->current_wal_gen) {
-        fclose(local_wal_fp);
-        local_wal_fp = NULL;
-    }
-
-    // Open file if we don't have one cached
-    if (local_wal_fp == NULL) {
-        local_wal_fp = fopen("lsm_data/wal_active.bin", "ab");
-        local_wal_gen = Manifest->current_wal_gen; // Sync with global generation
-    }
-
-    if (local_wal_fp) {
-        fwrite(&key, sizeof(uint32_t), 1, local_wal_fp);
-        fwrite(&val, sizeof(uint32_t), 1, local_wal_fp);
-        fflush(local_wal_fp); // Push to OS cache immediately!
-    }
-
-    bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, (uint32_t)val);
-
-    LWLockRelease(memtable_lock);
-    PG_RETURN_BOOL(success);
+    PG_RETURN_BOOL(lsm_internal_put((uint32_t)PG_GETARG_INT32(0),
+                                    (uint32_t)PG_GETARG_INT32(1)));
 }
 
 bool lsm_internal_get(uint32_t key, uint32_t *out_val) {
@@ -293,52 +234,11 @@ end_search:
 }
 
 Datum lsm_get(PG_FUNCTION_ARGS) {
-    int32 key = PG_GETARG_INT32(0);
     uint32_t val;
-
-    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
-    LWLock *memtable_lock = &lock_array[0].lock; 
-    
-    int local_file_counts[MAX_LSM_LEVELS];
-
-retry_search:
-    LWLockAcquire(memtable_lock, LW_SHARED);
-
-    bool found = sl_search(&Manifest->active_mem, (uint32_t)key, &val);
-    if (!found && Manifest->is_flushing) {
-        found = sl_search(&Manifest->immutable_mem, (uint32_t)key, &val);
-    }
-    
-    for (int i = 0; i < MAX_LSM_LEVELS; i++) {
-        local_file_counts[i] = Manifest->file_counts[i];
-    }
-
-    LWLockRelease(memtable_lock);
-
-    if (!found) {
-        for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
-            for (int idx = local_file_counts[lvl] - 1; idx >= 0; idx--) {
-                char filename[256];
-                snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
-                
-                if (sst_read(filename, (uint32_t)key, &val)) {
-                    found = true;
-                    goto end_search; 
-                } else if (access(filename, F_OK) != 0) {
-                    // File deleted mid-flight by compaction. Restart!
-                    goto retry_search;
-                }
-            }
-        }
-    }
-    
-end_search:
-    if (found) {
-        if (val == LSM_TOMBSTONE_VAL) PG_RETURN_NULL();
-        else PG_RETURN_INT32((int32)val);
-    } else {
-        PG_RETURN_NULL();
-    }
+    bool found = lsm_internal_get((uint32_t)PG_GETARG_INT32(0), &val);
+    if (!found) PG_RETURN_NULL();
+    if (val == LSM_TOMBSTONE_VAL) PG_RETURN_NULL();
+    PG_RETURN_INT32((int32)val);
 }
 
 /* Shared logic for both UDFs and FDW */
@@ -385,64 +285,8 @@ retry:
 }
 
 Datum lsm_delete(PG_FUNCTION_ARGS) {
-    int32 key = PG_GETARG_INT32(0);
-
-    LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
-    LWLock *memtable_lock = &lock_array[0].lock; 
-
-retry:
-    LWLockAcquire(memtable_lock, LW_EXCLUSIVE);
-
-    if (Manifest->active_mem.free_head_idx == LSM_NULL_INDEX) {
-        if (Manifest->is_flushing) {
-            LWLockRelease(memtable_lock);
-            pg_usleep(10000);
-            goto retry;
-        } else {
-            // THE SWAP
-            SkipList temp = Manifest->active_mem;
-            Manifest->active_mem = Manifest->immutable_mem;
-            Manifest->immutable_mem = temp;
-
-            Manifest->current_wal_gen++;
-
-            // If *this* process has an open file, close it
-            if (local_wal_fp) {
-                fclose(local_wal_fp);
-                local_wal_fp = NULL;
-            }
-            
-            rename("lsm_data/wal_active.bin", "lsm_data/wal_immutable.bin");
-            Manifest->is_flushing = true;
-            SetLatch(&Manifest->bgw_latch);
-        }
-    }
-
-    // Write Tombstone to WAL
-    // --- CACHED WRITE-AHEAD LOG ---
-    // Invalidate stale file descriptors if another process rotated the WAL
-    if (local_wal_fp != NULL && local_wal_gen != Manifest->current_wal_gen) {
-        fclose(local_wal_fp);
-        local_wal_fp = NULL;
-    }
-
-    // Open file if we don't have one cached
-    if (local_wal_fp == NULL) {
-        local_wal_fp = fopen("lsm_data/wal_active.bin", "ab");
-        local_wal_gen = Manifest->current_wal_gen; // Sync with global generation
-    }
-    if (local_wal_fp) {
-        uint32_t tombstone = LSM_TOMBSTONE_VAL;
-        fwrite(&key, sizeof(uint32_t), 1, local_wal_fp);
-        fwrite(&tombstone, sizeof(uint32_t), 1, local_wal_fp);
-        fflush(local_wal_fp);
-    }
-
-    // Insert Tombstone into memory
-    bool success = sl_insert(&Manifest->active_mem, (uint32_t)key, LSM_TOMBSTONE_VAL);
-
-    LWLockRelease(memtable_lock);
-    PG_RETURN_BOOL(success);
+    PG_RETURN_BOOL(lsm_internal_put((uint32_t)PG_GETARG_INT32(0),
+                                    LSM_TOMBSTONE_VAL));
 }
 
 // Define flag for loop exit
