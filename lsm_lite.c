@@ -325,9 +325,6 @@ lsm_worker_main(Datum main_arg) {
             if (success)
             {
                 elog(LOG, "LSM Flusher: Successfully wrote %s", filename);
-
-                // --- DELETE THE OBSOLETE WAL ---
-                unlink("lsm_data/wal_immutable.bin");
                 
                 // REBUILD THE FREE LIST IN THE BACKGROUND
                 LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
@@ -383,6 +380,7 @@ lsm_worker_main(Datum main_arg) {
                     fwrite(Manifest->file_counts, sizeof(int), MAX_LSM_LEVELS, manifest_fp);
                     fclose(manifest_fp);
                     rename("lsm_data/manifest.tmp", "lsm_data/manifest.bin");
+                    unlink("lsm_data/wal_immutable.bin"); // Clean up the immutable WAL since it's now safely on disk
                 }
             } 
             else 

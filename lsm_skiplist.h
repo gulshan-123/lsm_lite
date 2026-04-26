@@ -27,7 +27,6 @@ typedef struct {
 
 // Initialization and memory management
 SkipList* sl_create(int capacity);
-void sl_destroy(SkipList* list);
 
 // Core operations
 bool sl_insert(SkipList* list, uint32_t key, uint32_t value);
