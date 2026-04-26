@@ -59,7 +59,7 @@ static void lsm_shmem_request(void) {
     // Request space for Manifest + Two Node Pools
     Size total_size = sizeof(LsmManifest) + (2 * LSM_MEMTABLE_NODES * sizeof(SkipNode));
     RequestAddinShmemSpace(total_size);
-    RequestNamedLWLockTranche("lsm_lite_locks", 128);
+    RequestNamedLWLockTranche("lsm_lite_locks", 1);
 }
 
 // 2. Initialize memory (Safe inside Postmaster)

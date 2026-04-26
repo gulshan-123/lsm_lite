@@ -232,6 +232,15 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
         char in_name[256];
         snprintf(in_name, sizeof(in_name), "lsm_data/L%d_%d.sst", target_level, i);
         streams[i].fp = fopen(in_name, "rb");
+        if (!streams[i].fp) {
+            // Cleanup already opened files
+            for (int j = 0; j < i; j++) {
+                fclose(streams[j].fp);
+            }
+            free(streams);
+            fclose(out_fp);
+            return false;
+        }
         
         // Find where data ends by reading footer
         fseek(streams[i].fp, -20, SEEK_END);
