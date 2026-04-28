@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 
 typedef struct {
     FILE* fp;
@@ -126,14 +127,17 @@ bool sst_write(SkipList* list, const char* filename) {
     return true;
 }
 
-bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
+SstReadStatus sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     int fd = open(filename, O_RDONLY);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        if (errno == ENOENT) return SST_MISSING; // File was compacted away!
+        return SST_ERROR; // File descriptor limits, permissions, etc.
+    }
 
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size < 20) {
         close(fd);
-        return false;
+        return SST_ERROR;
     }
     size_t file_size = st.st_size;
 
@@ -141,7 +145,7 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     uint8_t* map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) {
         close(fd);
-        return false;
+        return SST_ERROR;
     }
 
     // === 2. SAFE FOOTER PARSING (Pointer Math) ===
@@ -157,7 +161,7 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     if (!bloom_check(bloom_filter, num_bits, search_key)) {
         munmap(map, file_size);
         close(fd);
-        return false;
+        return SST_NOT_FOUND;
     }
 
     // === 4. ZERO-COPY SPARSE INDEX BINARY SEARCH ===
@@ -215,12 +219,12 @@ bool sst_read(const char* filename, uint32_t search_key, uint32_t* out_value) {
     // === 6. CLEANUP ===
     munmap(map, file_size); // Instantly releases the mapping
     close(fd);
-    return found;
+    return found ? SST_FOUND : SST_NOT_FOUND;
 }
 
-bool sst_compact(int target_level, int num_files, int out_idx) {
+bool sst_compact(int target_level, int num_files, uint64_t* input_ids, uint64_t out_id) {
     char out_name[256];
-    snprintf(out_name, sizeof(out_name), "lsm_data/L%d_%d.sst", target_level + 1, out_idx);
+    snprintf(out_name, sizeof(out_name), "lsm_data/sst_%llu.sst", (unsigned long long)out_id);
     FILE* out_fp = fopen(out_name, "wb");
     if (!out_fp) return false;
 
@@ -230,7 +234,7 @@ bool sst_compact(int target_level, int num_files, int out_idx) {
     // 1. Initialize streams (Open all L0 files)
     for (int i = 0; i < num_files; i++) {
         char in_name[256];
-        snprintf(in_name, sizeof(in_name), "lsm_data/L%d_%d.sst", target_level, i);
+        snprintf(in_name, sizeof(in_name), "lsm_data/sst_%llu.sst", (unsigned long long)input_ids[i]);
         streams[i].fp = fopen(in_name, "rb");
         if (!streams[i].fp) {
             // Cleanup already opened files

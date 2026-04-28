@@ -26,6 +26,7 @@
 #define LSM_MEMTABLE_NODES (LSM_MAX_NODES/2)
 #define MAX_LSM_LEVELS 10
 #define COMPACTION_THRESHOLD 4
+#define MAX_FILES_PER_LEVEL 20 // Safe limit since threshold is 4
 
 #define LSM_TOMBSTONE_VAL 0xFFFFFFFFu // // UINT32_MAX — unreachable as a SQL integer
 
@@ -34,11 +35,14 @@ PG_MODULE_MAGIC;
 // The Global Manifest 
 typedef struct {
     bool is_flushing;
-    int file_counts[MAX_LSM_LEVELS]; // Tracks how many files exist at each level
-    int current_wal_gen;  // Tracks WAL rotations
-    Latch bgw_latch;       // The signal bell for our background worker
+    int current_wal_gen;
+    Latch bgw_latch;
     SkipList active_mem;
     SkipList immutable_mem;
+    
+    uint64_t next_file_id; 
+    int file_counts[MAX_LSM_LEVELS]; 
+    uint64_t file_ids[MAX_LSM_LEVELS][MAX_FILES_PER_LEVEL]; 
 } LsmManifest;
 
 // Process-local cache (Not in shared memory!)
@@ -85,6 +89,14 @@ static void lsm_shmem_startup(void) {
         }
         Manifest->is_flushing = false;
         Manifest->current_wal_gen = 0;
+        Manifest->next_file_id = 1; // Start at 1
+
+        for (int i = 0; i < MAX_LSM_LEVELS; i++) {
+            Manifest->file_counts[i] = 0;
+            for(int j = 0; j < MAX_FILES_PER_LEVEL; j++) {
+                Manifest->file_ids[i][j] = 0;
+            }
+        }
 
         InitSharedLatch(&Manifest->bgw_latch);
 
@@ -120,7 +132,9 @@ static void lsm_shmem_startup(void) {
         // --- 1. MANIFEST RECOVERY ---
         FILE* manifest_fp = fopen("lsm_data/manifest.bin", "rb");
         if (manifest_fp) {
+            fread(&Manifest->next_file_id, sizeof(uint64_t), 1, manifest_fp);
             fread(Manifest->file_counts, sizeof(int), MAX_LSM_LEVELS, manifest_fp);
+            fread(Manifest->file_ids, sizeof(uint64_t), MAX_LSM_LEVELS * MAX_FILES_PER_LEVEL, manifest_fp);
             fclose(manifest_fp);
             elog(LOG, "LSM Recovery: Manifest loaded successfully.");
         }
@@ -185,11 +199,6 @@ PG_FUNCTION_INFO_V1(lsm_put);
 PG_FUNCTION_INFO_V1(lsm_get);
 PG_FUNCTION_INFO_V1(lsm_delete);
 
-Datum lsm_put(PG_FUNCTION_ARGS) {
-    PG_RETURN_BOOL(lsm_internal_put((uint32_t)PG_GETARG_INT32(0),
-                                    (uint32_t)PG_GETARG_INT32(1)));
-}
-
 bool lsm_internal_get(uint32_t key, uint32_t *out_val) {
     bool found = false;
     LWLockPadded *lock_array = GetNamedLWLockTranche("lsm_lite_locks");
@@ -197,40 +206,48 @@ bool lsm_internal_get(uint32_t key, uint32_t *out_val) {
     
     // We snapshot the manifest state so we can read disk without locking
     int local_file_counts[MAX_LSM_LEVELS];
+    uint64_t local_file_ids[MAX_LSM_LEVELS][MAX_FILES_PER_LEVEL];
 
 retry_search:
     // 1. Grab lock ONLY to search memory and copy metadata
     LWLockAcquire(memtable_lock, LW_SHARED);
-    
+
     found = sl_search(&Manifest->active_mem, key, out_val);
     if (!found && Manifest->is_flushing)
         found = sl_search(&Manifest->immutable_mem, key, out_val);
         
     for (int i = 0; i < MAX_LSM_LEVELS; i++) {
         local_file_counts[i] = Manifest->file_counts[i];
-    }
-    LWLockRelease(memtable_lock); 
-
-    // 2. Search Disk (Thread-Safe & Lock-Free)
-    if (!found) {
-        for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
-            for (int idx = local_file_counts[lvl] - 1; idx >= 0; idx--) {
-                char filename[256];
-                snprintf(filename, sizeof(filename), "lsm_data/L%d_%d.sst", lvl, idx);
-                
-                if (sst_read(filename, key, out_val)) {
-                    found = true;
-                    goto end_search; 
-                } else if (access(filename, F_OK) != 0) {
-                    // OPTIMISTIC ABORT!
-                    // sst_read failed because the background worker deleted this file 
-                    // mid-compaction. The tree shape changed. Restart the search!
-                    goto retry_search;
-                }
-            }
+        for (int j = 0; j < Manifest->file_counts[i]; j++) {
+            local_file_ids[i][j] = Manifest->file_ids[i][j];
         }
     }
-    
+    LWLockRelease(memtable_lock);
+
+// 2. Search Disk using Immutable Monotonic IDs
+    if (!found) {
+        for (int lvl = 0; lvl < MAX_LSM_LEVELS; lvl++) {
+            // Traverse backward (newer files appended to the end of the array)
+            for (int idx = local_file_counts[lvl] - 1; idx >= 0; idx--) {
+                char filename[256];
+                uint64_t file_id = local_file_ids[lvl][idx];
+                snprintf(filename, sizeof(filename), "lsm_data/sst_%llu.sst", (unsigned long long)file_id);
+                
+                SstReadStatus status = sst_read(filename, key, out_val);
+                
+                if (status == SST_FOUND) {
+                    found = true;
+                    goto end_search; 
+                } else if (status == SST_MISSING) {
+                    // FILE WAS COMPACTED! Restart from top with new snapshot.
+                    goto retry_search;
+                } else if (status == SST_ERROR) {
+                    elog(ERROR, "LSM-Lite: System error reading SSTable %s", filename);
+                }
+                // If SST_NOT_FOUND, silently continue to the next file
+            }
+        }
+    }    
 end_search:
     if (found && *out_val == LSM_TOMBSTONE_VAL) return false;
     return found;
@@ -287,6 +304,11 @@ retry:
     return success;
 }
 
+Datum lsm_put(PG_FUNCTION_ARGS) {
+    PG_RETURN_BOOL(lsm_internal_put((uint32_t)PG_GETARG_INT32(0),
+                                    (uint32_t)PG_GETARG_INT32(1)));
+}
+
 Datum lsm_delete(PG_FUNCTION_ARGS) {
     PG_RETURN_BOOL(lsm_internal_put((uint32_t)PG_GETARG_INT32(0),
                                     LSM_TOMBSTONE_VAL));
@@ -317,8 +339,12 @@ lsm_worker_main(Datum main_arg) {
         ResetLatch(&Manifest->bgw_latch);
 
         if (Manifest->is_flushing) {
+            LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
+            uint64_t new_l0_id = Manifest->next_file_id++;
+            LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
+
             char filename[256];
-            snprintf(filename, sizeof(filename), "lsm_data/L0_%d.sst", Manifest->file_counts[0]);
+            snprintf(filename, sizeof(filename), "lsm_data/sst_%llu.sst", (unsigned long long)new_l0_id);
 
             bool success = sst_write(&Manifest->immutable_mem, filename);
 
@@ -342,45 +368,76 @@ lsm_worker_main(Datum main_arg) {
                 Manifest->immutable_mem.nodes[Manifest->immutable_mem.capacity - 1].next[0] = LSM_NULL_INDEX;
 
                 // Now it is safe to release the backpressure
-                Manifest->file_counts[0]++; // Increment L0 count
+                int l0_count = Manifest->file_counts[0];
+                if (l0_count < MAX_FILES_PER_LEVEL) {
+                    Manifest->file_ids[0][l0_count] = new_l0_id;
+                    Manifest->file_counts[0]++;
+                }
                 Manifest->is_flushing = false; 
                 LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
                 
                 // === THE CASCADING COMPACTION TRIGGER ===
                 int current_level = 0;
-                while (Manifest->file_counts[current_level] >= COMPACTION_THRESHOLD) {
-                    elog(LOG, "LSM Compaction: Triggering Level %d -> Level %d", current_level, current_level + 1);
+                while (true) {
+                    LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_SHARED);
+                    int count = Manifest->file_counts[current_level];
+                    LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
                     
-                    int out_idx = Manifest->file_counts[current_level + 1];
+                    if (count < COMPACTION_THRESHOLD) break;
+
+                    // Prepare Compaction
+                    LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
+                    uint64_t new_out_id = Manifest->next_file_id++;
+                    uint64_t input_ids[COMPACTION_THRESHOLD];
+                    // Grab the oldest files (indices 0 to THRESHOLD-1)
+                    for(int i=0; i < COMPACTION_THRESHOLD; i++) {
+                        input_ids[i] = Manifest->file_ids[current_level][i];
+                    }
+                    LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
                     
-                    if (sst_compact(current_level, COMPACTION_THRESHOLD, out_idx)) {
-                        // Success! Update the manifest.
+                    // Compact OUTSIDE the lock
+                    if (sst_compact(current_level, COMPACTION_THRESHOLD, input_ids, new_out_id)) {
+                        
                         LWLockAcquire(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock, LW_EXCLUSIVE);
-                        Manifest->file_counts[current_level] -= COMPACTION_THRESHOLD; // The 4 old files are gone
-                        Manifest->file_counts[current_level + 1]++; // We have 1 new file
+                        // Shift remaining files down in the current level
+                        int remaining = Manifest->file_counts[current_level] - COMPACTION_THRESHOLD;
+                        for (int i = 0; i < remaining; i++) {
+                            Manifest->file_ids[current_level][i] = Manifest->file_ids[current_level][i + COMPACTION_THRESHOLD];
+                        }
+                        Manifest->file_counts[current_level] = remaining;
+
+                        // Add new file to the next level
+                        int next_lvl_count = Manifest->file_counts[current_level + 1];
+                        if (next_lvl_count < MAX_FILES_PER_LEVEL) {
+                            Manifest->file_ids[current_level + 1][next_lvl_count] = new_out_id;
+                            Manifest->file_counts[current_level + 1]++;
+                        }
                         LWLockRelease(&GetNamedLWLockTranche("lsm_lite_locks")[0].lock);
 
+                        // Safe Unlink
                         for (int i = 0; i < COMPACTION_THRESHOLD; i++) {
                             char old_file[256];
-                            snprintf(old_file, sizeof(old_file), "lsm_data/L%d_%d.sst", current_level, i);
+                            snprintf(old_file, sizeof(old_file), "lsm_data/sst_%llu.sst", (unsigned long long)input_ids[i]);
                             unlink(old_file);
                         }
-                        
-                        current_level++; // Loop again to see if L1 -> L2 is needed!
+                        current_level++; 
                     } else {
                         elog(ERROR, "LSM Compaction Failed!");
                         break;
                     }
                 }
+
                 // --- SAVE THE MANIFEST TO DISK ---
                 // We write to a temporary file and rename it to prevent corruption 
                 // if the server crashes exactly while writing the manifest.
                 FILE* manifest_fp = fopen("lsm_data/manifest.tmp", "wb");
                 if (manifest_fp) {
+                    fwrite(&Manifest->next_file_id, sizeof(uint64_t), 1, manifest_fp);
                     fwrite(Manifest->file_counts, sizeof(int), MAX_LSM_LEVELS, manifest_fp);
+                    fwrite(Manifest->file_ids, sizeof(uint64_t), MAX_LSM_LEVELS * MAX_FILES_PER_LEVEL, manifest_fp);
                     fclose(manifest_fp);
                     rename("lsm_data/manifest.tmp", "lsm_data/manifest.bin");
-                    unlink("lsm_data/wal_immutable.bin"); // Clean up the immutable WAL since it's now safely on disk
+                    unlink("lsm_data/wal_immutable.bin"); 
                 }
             } 
             else 
